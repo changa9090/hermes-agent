@@ -91,13 +91,13 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "ddgs"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
-    # available backend. Firecrawl also counts as available when the managed
-    # tool gateway is configured for Nous subscribers.
+    # available backend. ddgs (DuckDuckGo) needs no API key and is always available.
     backend_candidates = (
+        ("ddgs", True),  # always available — no key required
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
@@ -107,11 +107,13 @@ def _get_backend() -> str:
         if available:
             return backend
 
-    return "firecrawl"  # default (backward compat)
+    return "ddgs"  # default to free DuckDuckGo (backward compat)
 
 
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
+    if backend == "ddgs":
+        return True  # no key required
     if backend == "exa":
         return _has_env("EXA_API_KEY")
     if backend == "parallel":
@@ -994,6 +996,74 @@ def _parallel_search(query: str, limit: int = 5) -> dict:
     return {"success": True, "data": {"web": web_results}}
 
 
+def _ddgs_search(query: str, limit: int = 5) -> dict:
+    """Search using DuckDuckGo via the ddgs CLI and return results as a dict."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["ddgs", "text", "-q", query, "-m", str(limit)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning("ddgs search failed: %s", result.stderr.strip())
+            return {"success": False, "data": {"web": []}}
+
+        web_results = []
+        lines = result.stdout.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            # Look for numbered result marker
+            if line and line[0].isdigit() and "." in line[:4]:
+                # Extract position
+                pos_str = line.split(".")[0].strip()
+                try:
+                    position = int(pos_str)
+                except ValueError:
+                    position = len(web_results) + 1
+                i += 1
+
+                url = ""
+                title = ""
+                description_parts = []
+                while i < len(lines):
+                    l = lines[i].strip()
+                    if not l:
+                        i += 1
+                        continue
+                    # Stop if we hit another numbered result
+                    if l[0].isdigit() and "." in l[:4]:
+                        break
+                    if l.startswith("href "):
+                        url = l[len("href "):].strip()
+                    elif l.startswith("title "):
+                        title = l[len("title "):].strip()
+                    elif l.startswith("body "):
+                        description_parts.append(l[len("body "):].strip())
+                    elif description_parts:
+                        # Continuation of body (indented or flowing text)
+                        description_parts.append(l)
+                    i += 1
+
+                if url:
+                    web_results.append({
+                        "url": url,
+                        "title": title,
+                        "description": " ".join(description_parts),
+                        "position": position,
+                    })
+            else:
+                i += 1
+
+        return {"success": True, "data": {"web": web_results}}
+    except Exception as e:
+        logger.warning("ddgs search exception: %s", e)
+        return {"success": False, "data": {"web": []}}
+
+
 async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
     """Extract content from URLs using the Parallel async SDK.
 
@@ -1095,6 +1165,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         # Dispatch to the configured backend
         backend = _get_backend()
+        if backend == "ddgs":
+            response_data = _ddgs_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         if backend == "parallel":
             response_data = _parallel_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
@@ -1933,9 +2012,9 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured in ("ddgs", "exa", "parallel", "firecrawl", "tavily"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    return any(_is_backend_available(backend) for backend in ("ddgs", "exa", "parallel", "firecrawl", "tavily"))
 
 
 def check_auxiliary_model() -> bool:
